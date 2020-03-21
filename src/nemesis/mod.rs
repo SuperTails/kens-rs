@@ -1,6 +1,7 @@
 use crate::bitstream::{IBitStream, OBitStream, ReadOrdered, WriteOrdered};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use multiset::HashMultiSet;
+use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::io::Cursor;
 use std::rc::Rc;
@@ -176,7 +177,47 @@ struct NibbleRun {
     pub count: u8,
 }
 
-fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: u32) {
+fn huffman_code_table(size_only_map: &HashMultiSet<usize>) -> Vec<(usize, u8)> {
+    // We now build the canonical Huffman code table.
+    // "base" is the code for the first nibble run with a given bit length.
+    // "carry" is how many nibble runs were demoted to a higher bit length
+    // at an earlier step.
+    // "cnt" is how many nibble runs have a given bit length.
+    let mut base = 0;
+    let mut carry = 0;
+    let mut cnt;
+    // This vector contains the codes sorted by size.
+    let mut codes = Vec::<(usize, u8)>::new();
+    for i in 1_u8..=8_u8 {
+        // How many nibble runs have the desired bit length.
+        cnt = size_only_map.count_of(&(i as usize)) + carry;
+        carry = 0;
+        let mut j = 0;
+        while j < cnt {
+            // Sequential binary numbers for codes.
+            let code = base + j;
+            let mask = (1 << i) - 1;
+            // We do not want any codes composed solely of 1's or which
+            // start with 111111, as that sequence is reserved.
+            if (i <= 6 && code == mask) || (i > 6 && code == (mask & !((1 << (i - 6)) - 1))) {
+                // We must demote this many nibble runs to a longer code.
+                carry = cnt - j;
+                cnt = j;
+                break;
+            } else {
+                codes.push((code, i));
+            }
+
+            j += 1;
+        }
+        // This is the beginning bit pattern for the next bit length.
+        base = (base + cnt) << 1;
+    }
+
+    codes
+}
+
+fn encode_build_runs(src: &[u8]) -> (Vec<NibbleRun>, HashMap<NibbleRun, usize>) {
     // Unpack source so we don't have to deal with nibble IO after.
     let mut unpack = Vec::new();
     for s in src {
@@ -189,6 +230,7 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
     // Maximum run length is 8, meaning 7 repetitions.
     let mut rle_src = Vec::<NibbleRun>::new();
     let mut counts = HashMap::<NibbleRun, usize>::new();
+
     let mut curr = NibbleRun {
         nibble: unpack[0],
         count: 0,
@@ -203,8 +245,14 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
             curr.count += 1;
         }
     }
-    // No longer needed.
-    unpack.clear();
+
+    (rle_src, counts)
+}
+
+fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: bool) {
+    // Build RLE nibble runs, RLE-encoding the nibble runs as we go along.
+    // Maximum run length is 8, meaning 7 repetitions.
+    let (rle_src, counts) = encode_build_runs(src);
 
     // We will use the Package-merge algorithm to build the optimal length-limited
     // Huffman code for the current file. To do this, we must map the current
@@ -214,9 +262,9 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
         .iter()
         // No point in including anything with weight less than 2, as they
         // would actually increase compressed file size if used.
-        .filter(|i| *i.1 > 1)
-        .map(|i| Rc::new(Node::leaf(*i.0, *i.1 as u32)))
-        .collect::<BinaryHeap<Rc<Node>>>();
+        .filter(|(_run, &freq)| freq > 1)
+        .map(|(&run, &freq)| Reverse(Rc::new(Node::leaf(run, freq as u32))))
+        .collect::<BinaryHeap<Reverse<Rc<Node>>>>();
 
     // The base coin collection for the length-limited Huffman coding has
     // one coin list per character in length of the limmitation. Each coin list
@@ -228,7 +276,7 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
     // This will hold the Huffman code map.
     let mut codemap = HashMap::<NibbleRun, (usize, u8)>::new();
     // Size estimate. This is used to build the optimal compressed file.
-    let mut size_est = 0xff_ff_ff_ff;
+    let mut size_est = std::usize::MAX;
 
     // We will solve the Coin Collector's problem several times, each time
     // ignoring more of the least frequent nibble runs. This allows us to find
@@ -253,11 +301,12 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
         while target != 0 {
             // Gets lowest bit set in its proper place:
             let val = ((target as isize) & -(target as isize)) as usize;
+
             let r = 1 << idx;
             // Is the current denomination equal to the least denomination?
             if r == val {
                 // If yes, take the least valuable node and put it into the solution.
-                solution.push(q.pop().unwrap());
+                solution.push(q.pop().unwrap().0);
                 target -= r;
             }
 
@@ -272,9 +321,9 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
             // Split the current list into pairs and insert the packages into
             // the next list.
             while q.len() > 1 {
-                let child1 = q.pop().unwrap();
-                let child0 = q.pop().unwrap();
-                q1.push(Rc::new(Node::branch(child0, child1)));
+                let child1 = q.pop().unwrap().0;
+                let child0 = q.pop().unwrap().0;
+                q1.push(Reverse(Rc::new(Node::branch(child0, child1))));
             }
             idx += 1;
             q = q1;
@@ -291,6 +340,7 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
         for it in solution.iter() {
             it.traverse(&mut base_size_map)
         }
+        let base_size_map = base_size_map;
 
         // With the length-limited Huffman coding problem solved, it is now time
         // to build the code table. As input, we have a map associating a nibble
@@ -312,41 +362,7 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
             size_map.insert((size, count, count_idx));
         }
 
-        // We now build the canonical Huffman code table.
-        // "base" is the code for the first nibble run with a given bit length.
-        // "carry" is how many nibble runs were demoted to a higher bit length
-        // at an earlier step.
-        // "cnt" is how many nibble runs have a given bit length.
-        let mut base = 0;
-        let mut carry = 0;
-        let mut cnt;
-        // This vector contains the codes sorted by size.
-        let mut codes = Vec::<(usize, u8)>::new();
-        for i in 1_u8..=8_u8 {
-            // How many nibble runs have the desired bit length.
-            cnt = size_only_map.count_of(&(i as usize)) + carry;
-            carry = 0;
-            let mut j = 0;
-            while j < cnt {
-                // Sequential binary numbers for codes.
-                let code = base + j;
-                let mask = (1 << i) - 1;
-                // We do not want any codes composed solely of 1's or which
-                // start with 111111, as that sequence is reserved.
-                if (i <= 6 && code == mask) || (i > 6 && code == (mask & !((1 << (i - 6)) - 1))) {
-                    // We must demote this many nibble runs to a longer code.
-                    carry = cnt - j;
-                    cnt = j;
-                    break;
-                } else {
-                    codes.push((code, i));
-                }
-
-                j += 1;
-            }
-            // This is the beginning bit pattern for the next bit length.
-            base = (base + cnt) << 1;
-        }
+        let codes = huffman_code_table(&size_only_map);
 
         // With the canonical table build, the codemap can finally be built.
         let temp_code_map = size_map
@@ -371,7 +387,7 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
     if qt.len() == 1 {
         let mut temp_code_map = HashMap::<NibbleRun, (usize, u8)>::new();
         let child = qt.peek().unwrap();
-        let value = if let Node::Leaf { value, .. } = &**child {
+        let value = if let Node::Leaf { value, .. } = &*child.0 {
             *value
         } else {
             unreachable!()
@@ -386,18 +402,29 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
         }
     }
     // This is no longer needed.
-    counts.clear();
+    std::mem::drop(counts);
 
+    encode_write_out(dst, mode, &rle_src, &codemap, src.len());
+}
+
+fn encode_write_out<W: WriteOrdered<u8> + ?Sized>(
+    dst: &mut W,
+    mode: bool,
+    rle_src: &[NibbleRun],
+    codemap: &HashMap<NibbleRun, (usize, u8)>,
+    src_len: usize,
+) {
     // We now have a prefix-free code map associating the RLE-encoded nibble
     // runs with their code. Now we write the file.
-    // Write header.
-    dst.write_u16::<BigEndian>(((mode as u16) << 15) | (src.len() >> 5) as u16)
+
+    /* --- Write Header --- */
+    dst.write_u16::<BigEndian>(((mode as u16) << 15) | (src_len >> 5) as u16)
         .unwrap();
     let mut last_nibble = 0xff;
-    for (run, (code, len)) in codemap.iter() {
+    for (run, &(code, len)) in codemap.iter() {
         // len with bit 7 set is a special device for further reducing file size, and
         // should NOT be on the table.
-        if (len & 0x80) != 0 {
+        if len & 0x80 != 0 {
             continue;
         }
 
@@ -408,11 +435,12 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
         }
 
         dst.write_u8((run.count << 4) | len).unwrap();
-        dst.write_u8(*code as u8).unwrap();
+        dst.write_u8(code as u8).unwrap();
     }
 
     // Mark end of header.
     dst.write_u8(0xFF).unwrap();
+    /* --- End Header --- */
 
     // Time to write the encoded bitstream.
     let mut bits = OBitStream::<u8, BigEndian>::new();
@@ -446,6 +474,12 @@ fn encode_internal<W: WriteOrdered<u8> + ?Sized>(src: &[u8], dst: &mut W, mode: 
     bits.flush(dst, false);
 }
 
+#[allow(dead_code)]
+fn split_at_header(src: &[u8]) -> (&[u8], &[u8]) {
+    let idx = src.iter().enumerate().find(|(_, s)| **s == 0xFF).unwrap().0;
+    (&src[..=idx], &src[idx + 1..])
+}
+
 pub fn encode(src: &[u8]) -> Result<Vec<u8>, ()> {
     let mut src = src.to_vec();
 
@@ -474,8 +508,8 @@ pub fn encode(src: &[u8]) -> Result<Vec<u8>, ()> {
     let mut mode_1_buf = Vec::<u8>::new();
 
     // Encode in both modes.
-    encode_internal(&src, &mut mode_0_buf, 0);
-    encode_internal(&sin, &mut mode_1_buf, 1);
+    encode_internal(&src, &mut mode_0_buf, false);
+    encode_internal(&sin, &mut mode_1_buf, true);
 
     let mut smaller = if mode_0_buf.len() <= mode_1_buf.len() {
         mode_0_buf
@@ -492,56 +526,54 @@ pub fn encode(src: &[u8]) -> Result<Vec<u8>, ()> {
 }
 
 fn estimate_file_size(
-    mut temp_code_map: HashMap<NibbleRun, (usize, u8)>,
+    mut codemap: HashMap<NibbleRun, (usize, u8)>,
     counts: &HashMap<NibbleRun, usize>,
 ) -> usize {
     // We now compute the final file size for this code table.
     // 2 bytes at the start of the file, plus 1 byte at the end of the
     // code table.
-    let mut tempsize_est = 3 * 8;
+    let mut size_est = 3 * 8;
     let mut last = 0xff;
     // Start with any nibble runs with their own code.
-    for it in temp_code_map.iter() {
+    for (run, rhs) in codemap.iter() {
         // Each new nibble needs an extra byte.
-        if last != it.0.nibble {
-            tempsize_est += 8;
+        if last != run.nibble {
+            size_est += 8;
             // Be sure to SET the last nibble to the current nibble... this
             // fixes a bug that caused file sizes to increase in some cases.
-            last = it.0.nibble;
+            last = run.nibble;
         }
         // 2 bytes per nibble run in the table.
-        tempsize_est += 2 * 8;
+        size_est += 2 * 8;
         // How many bits this nibble run uses in the file.
-        tempsize_est += *counts.get(it.0).unwrap() as usize * (it.1).1 as usize;
+        size_est += *counts.get(run).unwrap() as usize * rhs.1 as usize;
     }
 
     // Supplementary code map for the nibble runs that can be broken up into
     // shorter nibble runs with a smaller bit length than inlining.
     let mut sup_code_map = HashMap::<NibbleRun, (usize, u8)>::new();
     // Now we will compute the size requirements for inline nibble runs.
-    for it in counts.iter() {
+    for (run, run_count) in counts.iter() {
         // Find out if this nibble run has a code for it.
-        let it2 = temp_code_map.get(it.0);
-        if it2.is_none() {
+        if !codemap.contains_key(run) {
             // Nibble run does not have its own code. We need to find out if
             // we can break it up into smaller nibble runs with total code
             // size less than 13 bits or if we need to inline it (13 bits).
-            if it.0.count == 0 {
+            if run.count == 0 {
                 // If this is a nibble run with zero repeats, we can't break
                 // it up into smaller runs, so we inline it.
-                tempsize_est += (6 + 7) * it.1;
-            } else if it.0.count == 1 {
+                size_est += (6 + 7) * run_count;
+            } else if run.count == 1 {
                 // We stand a chance of breaking the nibble run.
 
                 // This case is rather trivial, so we hard-code it.
                 // We can break this up only as 2 consecutive runs of a nibble
                 // run with count == 0.
                 let trg = NibbleRun {
-                    nibble: it.0.nibble,
+                    nibble: run.nibble,
                     count: 0,
                 };
-                let it2 = temp_code_map.get(&trg).copied();
-                match it2 {
+                match codemap.get(&trg).copied() {
                     Some((mut code, mut len)) if len <= 6 => {
                         // The smaller nibble run has a small enough code that it is
                         // more efficient to use it twice than to inline our nibble
@@ -550,15 +582,15 @@ fn estimate_file_size(
                         // into the main codemap.
                         code = (code << len) | code;
                         len <<= 1;
-                        tempsize_est += len as usize * *it.1;
-                        sup_code_map.insert(*it.0, (code, 0x80 | len));
+                        size_est += len as usize * *run_count;
+                        sup_code_map.insert(*run, (code, 0x80 | len));
                     }
                     _ => {
                         // The smaller nibble run either does not have its own code
                         // or it results in a longer bit code when doubled up than
                         // would result from inlining the run. In either case, we
                         // inline the nibble run.
-                        tempsize_est += (6 + 7) * it.1;
+                        size_est += (6 + 7) * run_count;
                     }
                 }
             } else {
@@ -634,7 +666,7 @@ fn estimate_file_size(
                     &[0, 0, 0, 2, 0, 0, 0],
                 ];
 
-                let n = it.0.count;
+                let n = run.count;
                 // Get correct coefficient table:
                 let (linear_coeffs, rows) = match n {
                     2 => (&LINEAR_COEFFS_2[..], 2),
@@ -646,7 +678,7 @@ fn estimate_file_size(
                     _ => unreachable!(),
                 };
 
-                let nibble = it.0.nibble;
+                let nibble = run.nibble;
                 // Vector containing the code length of each nibble run, or 13
                 // if the nibble run is not in the codemap.
                 let mut run_len = Vec::<usize>::new();
@@ -654,7 +686,7 @@ fn estimate_file_size(
                 for i in 0..n {
                     // Is this run in the codemap?
                     let trg = NibbleRun { nibble, count: i };
-                    let it3 = temp_code_map.get(&trg);
+                    let it3 = codemap.get(&trg);
                     if let Some(it3) = it3 {
                         // It is.
                         // Put code length in the vector.
@@ -711,7 +743,7 @@ fn estimate_file_size(
                             nibble,
                             count: i as u8,
                         };
-                        let it3 = temp_code_map.get(&trg);
+                        let it3 = codemap.get(&trg);
                         if let Some(it3) = it3 {
                             // It is; it MUST be, as the other case is impossible
                             // by construction.
@@ -733,25 +765,25 @@ fn estimate_file_size(
                         // By construction, best_size is at most 12.
                         let c = best_size;
                         // Add it to supplementary code map.
-                        sup_code_map.insert(*it.0, (code, 0x80 | c as u8));
-                        tempsize_est += best_size as usize * *it.1;
+                        sup_code_map.insert(*run, (code, 0x80 | c as u8));
+                        size_est += best_size as usize * *run_count;
                     }
                 } else {
                     // No, we will have to inline it.
-                    tempsize_est += (6 + 7) * it.1;
+                    size_est += (6 + 7) * run_count;
                 }
             }
         }
     }
 
-    temp_code_map.extend(sup_code_map);
+    codemap.extend(sup_code_map);
 
     // Round up to a full byte.
-    if (tempsize_est & 7) != 0 {
-        tempsize_est = (tempsize_est & !7) + 8;
+    if size_est & 7 != 0 {
+        size_est = (size_est & !7) + 8;
     }
 
-    tempsize_est
+    size_est
 }
 
 #[cfg(test)]
@@ -759,38 +791,36 @@ mod test {
     use super::*;
 
     const RING_DECOMPRESSED: [u8; 448] = [
-        0x00, 0x00, 0x0D, 0xC6, 0x00, 0x0D, 0xCD, 0xCC, 0xCC, 0xDC, 0xCD, 0xEF, 0x0E, 0xDC,
-        0xDE, 0x00, 0x0E, 0xCD, 0x0D, 0x00, 0xED, 0xCE, 0x0E, 0x00, 0xEC, 0xC0, 0x00, 0x00,
-        0xEC, 0x60, 0x00, 0x00, 0xEC, 0x60, 0x00, 0x00, 0xEC, 0x60, 0x00, 0x00, 0xED, 0x6C,
-        0x00, 0x00, 0x0E, 0xC6, 0x00, 0x00, 0x0E, 0xDC, 0x6C, 0x0C, 0x00, 0xED, 0xC6, 0x66,
-        0x00, 0x0E, 0xED, 0xCD, 0x00, 0x00, 0x0E, 0xEE, 0x66, 0x60, 0x00, 0x00, 0xCC, 0xC6,
-        0x60, 0x00, 0xEE, 0xDC, 0x6E, 0x66, 0x00, 0xEE, 0xD6, 0x60, 0x00, 0x00, 0xEC, 0x60,
-        0x00, 0x00, 0xED, 0xC6, 0x00, 0x00, 0x0E, 0xC6, 0x00, 0x00, 0x0E, 0xC6, 0x00, 0x00,
-        0x0E, 0xC6, 0x00, 0x00, 0x0E, 0xCE, 0xCC, 0x00, 0xED, 0xCD, 0x0D, 0x00, 0xDC, 0xC0,
-        0x00, 0xED, 0xCD, 0xD0, 0x6C, 0xCC, 0xDD, 0xDD, 0xCC, 0xDE, 0xE0, 0x00, 0xEE, 0xE0,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0xDD, 0x00, 0x00, 0x0D, 0xCD, 0xCC, 0x00, 0xDC, 0xDE,
-        0x00, 0x0D, 0xCD, 0xE0, 0x00, 0x0D, 0xCE, 0x0E, 0x00, 0xEC, 0xDE, 0x0E, 0x00, 0xEC,
-        0xD0, 0x00, 0x00, 0xEC, 0xD0, 0x00, 0x00, 0xEC, 0xD0, 0x00, 0x00, 0xEC, 0xD0, 0x00,
-        0x00, 0xEC, 0xDE, 0x00, 0x00, 0x0E, 0xCD, 0x00, 0x00, 0x0E, 0xCD, 0xD0, 0x00, 0x00,
-        0xEC, 0xCD, 0x00, 0x00, 0x0E, 0xDC, 0x0C, 0x00, 0x00, 0xEE, 0xEE, 0xCC, 0x00, 0x00,
-        0xCC, 0x6C, 0x0C, 0x00, 0xED, 0xC6, 0xC0, 0x00, 0x0E, 0xDC, 0x60, 0x00, 0x00, 0xDC,
-        0x6C, 0x0C, 0x00, 0xED, 0x6C, 0x0C, 0x00, 0xED, 0xC6, 0x06, 0x00, 0xED, 0xC6, 0x06,
-        0x00, 0xED, 0xC6, 0x06, 0x00, 0xED, 0xC6, 0x06, 0x00, 0xED, 0x6D, 0x0D, 0x00, 0xDC,
-        0xCE, 0x00, 0x0E, 0xDC, 0xD0, 0x00, 0xDD, 0xDD, 0xE0, 0x00, 0xCC, 0xEE, 0xEE, 0x00,
-        0xEE, 0xEE, 0x00, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0x00, 0xC6, 0x6C, 0x00, 0x0D, 0x6F,
-        0x66, 0xD0, 0x0D, 0x6F, 0x66, 0xD0, 0x0D, 0x6F, 0x66, 0xD0, 0x0D, 0x6F, 0x66, 0xD0,
-        0x0D, 0xC6, 0x6C, 0xD0, 0x0D, 0xC6, 0x6C, 0xD0, 0x0E, 0xCE, 0xCC, 0xE0, 0x0E, 0xCE,
-        0xCC, 0xE0, 0x0E, 0xDC, 0xCD, 0xE0, 0x0E, 0xDC, 0xCD, 0xE0, 0x0E, 0xDF, 0xDD, 0xE0,
-        0x0E, 0xDF, 0xDD, 0xE0, 0x00, 0xED, 0xDE, 0x00, 0x00, 0x0E, 0xE0, 0x00, 0x00, 0x00,
-        0xE0, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x0E, 0x6E, 0x0E,
-        0x00, 0xED, 0x6D, 0xE0, 0xED, 0xC6, 0x66, 0xCD, 0x0D, 0xED, 0x6D, 0xE0, 0x00, 0x0E,
-        0x6E, 0x0E, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x00, 0xE0, 0x00,
-        0x00, 0x0D, 0x0D, 0x00, 0x00, 0xDC, 0xD0, 0x00, 0x00, 0x0D, 0x0D, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00, 0xD0, 0x00,
-        0x00, 0x0E, 0xCE, 0x00, 0x0E, 0xDC, 0x6C, 0xDE, 0x00, 0x0E, 0xCE, 0x0E, 0xE0, 0x00,
-        0xD0, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00,
-        0x00, 0x0D, 0x0D, 0x00, 0x00, 0xEC, 0xE0, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x0E,
-        0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x0D, 0xC6, 0x00, 0x0D, 0xCC, 0xCC, 0x00, 0xDC, 0xCD, 0xEE, 0x0E, 0xDC, 0xDE,
+        0x00, 0x0E, 0xCD, 0x00, 0x00, 0xED, 0xCE, 0x00, 0x00, 0xEC, 0xC0, 0x00, 0x00, 0xEC, 0x60,
+        0x00, 0x00, 0xEC, 0x60, 0x00, 0x00, 0xEC, 0x60, 0x00, 0x00, 0xED, 0x6C, 0x00, 0x00, 0x0E,
+        0xC6, 0x00, 0x00, 0x0E, 0xDC, 0x6C, 0x00, 0x00, 0xED, 0xC6, 0x66, 0x00, 0x0E, 0xED, 0xCC,
+        0x00, 0x00, 0x0E, 0xEE, 0x66, 0x60, 0x00, 0x00, 0xCC, 0xC6, 0x60, 0x00, 0xEE, 0xDC, 0x66,
+        0x00, 0x00, 0xEE, 0xD6, 0x60, 0x00, 0x00, 0xEC, 0x60, 0x00, 0x00, 0xED, 0xC6, 0x00, 0x00,
+        0x0E, 0xC6, 0x00, 0x00, 0x0E, 0xC6, 0x00, 0x00, 0x0E, 0xC6, 0x00, 0x00, 0x0E, 0xCC, 0x00,
+        0x00, 0xED, 0xCD, 0x00, 0x00, 0xDC, 0xC0, 0x00, 0xED, 0xCC, 0xD0, 0x6C, 0xCC, 0xDD, 0x00,
+        0xCC, 0xDE, 0xE0, 0x00, 0xEE, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00, 0xDD, 0x00, 0x00, 0x0D,
+        0xCC, 0x00, 0x00, 0xDC, 0xDE, 0x00, 0x0D, 0xCD, 0xE0, 0x00, 0x0D, 0xCE, 0x00, 0x00, 0xEC,
+        0xDE, 0x00, 0x00, 0xEC, 0xD0, 0x00, 0x00, 0xEC, 0xD0, 0x00, 0x00, 0xEC, 0xD0, 0x00, 0x00,
+        0xEC, 0xD0, 0x00, 0x00, 0xEC, 0xDE, 0x00, 0x00, 0x0E, 0xCD, 0x00, 0x00, 0x0E, 0xCD, 0xD0,
+        0x00, 0x00, 0xEC, 0xCD, 0x00, 0x00, 0x0E, 0xDC, 0x00, 0x00, 0x00, 0xEE, 0xCC, 0x00, 0x00,
+        0x00, 0xCC, 0x6C, 0x00, 0x00, 0xED, 0xC6, 0xC0, 0x00, 0x0E, 0xDC, 0x60, 0x00, 0x00, 0xDC,
+        0x6C, 0x00, 0x00, 0xED, 0x6C, 0x00, 0x00, 0xED, 0xC6, 0x00, 0x00, 0xED, 0xC6, 0x00, 0x00,
+        0xED, 0xC6, 0x00, 0x00, 0xED, 0xC6, 0x00, 0x00, 0xED, 0x6D, 0x00, 0x00, 0xDC, 0xCE, 0x00,
+        0x0E, 0xDC, 0xD0, 0x00, 0xDD, 0xCC, 0xE0, 0x00, 0xCC, 0xEE, 0x00, 0x00, 0xEE, 0x00, 0x00,
+        0x00, 0x00, 0x0C, 0xC0, 0x00, 0x00, 0xC6, 0x6C, 0x00, 0x0D, 0x66, 0x66, 0xD0, 0x0D, 0x66,
+        0x66, 0xD0, 0x0D, 0x66, 0x66, 0xD0, 0x0D, 0x66, 0x66, 0xD0, 0x0D, 0xC6, 0x6C, 0xD0, 0x0D,
+        0xC6, 0x6C, 0xD0, 0x0E, 0xCC, 0xCC, 0xE0, 0x0E, 0xCC, 0xCC, 0xE0, 0x0E, 0xDC, 0xCD, 0xE0,
+        0x0E, 0xDC, 0xCD, 0xE0, 0x0E, 0xDD, 0xDD, 0xE0, 0x0E, 0xDD, 0xDD, 0xE0, 0x00, 0xED, 0xDE,
+        0x00, 0x00, 0x0E, 0xE0, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x00,
+        0xC0, 0x00, 0x00, 0x0E, 0x6E, 0x00, 0x00, 0xED, 0x6D, 0xE0, 0xED, 0xC6, 0x66, 0xCD, 0x00,
+        0xED, 0x6D, 0xE0, 0x00, 0x0E, 0x6E, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0xD0, 0x00,
+        0x00, 0x00, 0xE0, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x00, 0xDC, 0xD0, 0x00, 0x00, 0x0D, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00,
+        0xD0, 0x00, 0x00, 0x0E, 0xCE, 0x00, 0x0E, 0xDC, 0x6C, 0xDE, 0x00, 0x0E, 0xCE, 0x00, 0xE0,
+        0x00, 0xD0, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00,
+        0x00, 0x0D, 0x00, 0x00, 0x00, 0xEC, 0xE0, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x0E, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
     #[test]
@@ -805,32 +835,34 @@ mod test {
 
     #[test]
     fn ring_roundtrip() {
-        let compressed = encode(&RING_DECOMPRESSED).unwrap();
-        println!("Attempting to decode:\n{:X?}", compressed);
+        roundtrip(&RING_DECOMPRESSED)
+    }
+
+    fn roundtrip(data: &[u8]) {
+        let compressed = encode(data).unwrap();
+        println!("Attempting to decode:\n{:X?}", split_at_header(&compressed));
         let mut result = Vec::new();
         decode(&mut &compressed[..], &mut result);
 
-        if result != &RING_DECOMPRESSED[..] {
-            eprintln!("Expected length: {:#X}", RING_DECOMPRESSED.len());
+        if result != data {
+            eprintln!("Expected length: {:#X}", data.len());
             eprintln!("Actual length: {:#X}", result.len());
 
-            panic!("Expected:\n{:X?}\nActual:\n{:X?}", &RING_DECOMPRESSED[..], result);
+            eprintln!("Expected:\n{:X?}\nActual:\n{:X?}", data, result);
+
+            for (idx, (ex, ac)) in data.iter().zip(result.iter()).enumerate() {
+                if ex != ac {
+                    eprintln!("[{:#05X}] {:#04X} != {:#04X}", idx, ex, ac);
+                }
+            }
+
+            panic!();
         }
     }
 
     #[test]
-    fn roundtrip() {
+    fn roundtrip_string() {
         const DATA: &[u8; 0x60] = b"Lorem ipsum dolor sit amet\0heeeeeeeeeeeeeeeeck why is this so hardpaddingpaddingpaddingpaddingpa";
-        let compressed = encode(DATA).unwrap();
-        println!("Attempting to decode:\n{:X?}", compressed);
-        let mut result = Vec::new();
-        decode(&mut &compressed[..], &mut result);
-
-        if result != &DATA[..] {
-            eprintln!("Expected length: {:#X}", DATA.len());
-            eprintln!("Actual length: {:#X}", result.len());
-
-            panic!("Expected:\n{:X?}\nActual:\n{:X?}", &DATA[..], result);
-        }
+        roundtrip(&DATA[..]);
     }
 }

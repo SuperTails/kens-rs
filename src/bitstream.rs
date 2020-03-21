@@ -169,14 +169,17 @@ impl<T: PrimInt, Order: ByteOrder> OBitStream<T, Order> {
     }
 
     /// Puts a single bit into the stream. Remembers previously written bits,
-    /// and outputs a character to the actual stream once there are at least
-    /// sizeof(T) * 8 bits stored in the buffer.
+    /// and outputs a character to the actual stream once there
+    /// are `bit_width()` bits stored in the buffer.
+    ///
+    /// This puts the new bit as the LSB, i.e. on the right side of `byte_buffer`
     pub fn put<W: WriteOrdered<T>>(&mut self, mut dst: W, data: bool) -> bool {
         let bit = if data { T::one() } else { T::zero() };
 
         self.byte_buffer = (self.byte_buffer << 1) | bit;
         self.waiting_bits += 1;
         if self.waiting_bits >= Self::bit_width() {
+            // Buffer is full
             dst.write_ordered::<Order>(self.byte_buffer).unwrap();
             self.waiting_bits = 0;
             true
@@ -187,14 +190,17 @@ impl<T: PrimInt, Order: ByteOrder> OBitStream<T, Order> {
 
     /// Puts a single bit into the stream. Remembers previously written bits,
     /// and outputs a character to the actual stream once there are at least
-    /// sizeof(T) * 8 bits stored in the buffer.
-    /// Treats bits as being in the reverse order of the put function.
+    /// `bit_width()` bits stored in the buffer.
+    ///
+    /// Treats bits as being in the reverse order of the put function, i.e.
+    /// it stores new bits on top of/on the left of `byte_buffer`
     pub fn push<W: WriteOrdered<T>>(&mut self, dst: &mut W, data: bool) -> bool {
         let bit = if data { T::one() } else { T::zero() };
 
         self.byte_buffer = self.byte_buffer | (bit << self.waiting_bits as usize);
         self.waiting_bits += 1;
         if self.waiting_bits >= Self::bit_width() {
+            // Buffer is full
             dst.write_ordered::<Order>(self.byte_buffer).unwrap();
             self.waiting_bits = 0;
             self.byte_buffer = T::zero();
@@ -204,17 +210,26 @@ impl<T: PrimInt, Order: ByteOrder> OBitStream<T, Order> {
         }
     }
 
-    /// Writes up to sizeof(T) * 8 bits to the stream. Remembers previously written bits,
-    /// and outputs a character to the actual stream once there are at least
-    /// sizeof(T) * 8 bits stored in the buffer.
+    /// Writes up to `bit_width()` bits to the stream. Remembers previously written bits,
+    /// and outputs a character to the actual stream once there are
+    /// `bit_width()` bits stored in the buffer.
     pub fn write<W: WriteOrdered<T> + ?Sized>(&mut self, dst: &mut W, data: T, size: u32) -> bool {
-        if self.waiting_bits + size >= Self::bit_width() {
-            let delta = (Self::bit_width() - self.waiting_bits) % Self::bit_width();
-            self.waiting_bits = (self.waiting_bits + size) % Self::bit_width();
-            dst.write_ordered::<Order>(
-                (self.byte_buffer << delta as usize) | (data >> self.waiting_bits as usize),
-            )
-            .unwrap();
+        assert!(size <= Self::bit_width());
+
+        let new_waiting_bits = self.waiting_bits + size;
+
+        if new_waiting_bits >= Self::bit_width() {
+            // Buffer will end up full
+            let delta = Self::bit_width() - self.waiting_bits;
+            self.waiting_bits = new_waiting_bits % Self::bit_width();
+
+            let out_hi = if delta == Self::bit_width() {
+                T::zero()
+            } else {
+                self.byte_buffer << delta as usize
+            };
+            dst.write_ordered::<Order>(out_hi | (data >> self.waiting_bits as usize))
+                .unwrap();
             self.byte_buffer = data;
             true
         } else {
