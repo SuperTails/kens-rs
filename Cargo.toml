@@ -1,0 +1,20 @@
+[package]
+name = "kens-sys"
+version = "0.1.0"
+authors = ["Carson Swoveland <sciencedude2003@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "kens_sys"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kens_sys"
+path = "src/bin/main.rs"
+
+[dependencies]
+byteorder = "1.3.4"
+num-traits = "0.2"
+multiset = "0.0.5"
