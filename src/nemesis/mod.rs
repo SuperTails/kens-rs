@@ -1,7 +1,7 @@
 //! Functions for compressing/decompressing Nemesis-formatted data
 
-use crate::io_traits::{ReadOrdered, WriteOrdered};
 use crate::bitstream::{IBitStream, OBitStream};
+use crate::io_traits::{ReadOrdered, WriteOrdered};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use multiset::HashMultiSet;
 use std::cmp::Reverse;
@@ -163,7 +163,7 @@ fn decode_internal<R: ReadOrdered<u8> + ?Sized, W: WriteOrdered<u8> + ?Sized>(
 }
 
 /// Decompresses data that has been Nemesis encoded
-/// 
+///
 /// If `moduled` is true then the data will be interpreted
 /// as being in the Kosinski Moduled format, as used in
 /// Sonic 3 and Knuckles
