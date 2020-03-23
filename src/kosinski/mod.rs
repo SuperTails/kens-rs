@@ -1,4 +1,7 @@
-use crate::bitstream::{IBitStream, OBitStream, WriteOrdered};
+//! Functions for compressing/decompressing Kosinski-formatted data
+
+use crate::bitstream::{IBitStream, OBitStream};
+use crate::io_traits::WriteOrdered;
 use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use num_traits::PrimInt;
 use std::convert::TryFrom;
@@ -111,6 +114,7 @@ pub const DEFAULT_SLIDE_WIN: usize = 8192;
 pub const DEFAULT_REC_LEN: usize = 256;
 pub const DEFAULT_MODULE_SIZE: usize = 0x1000;
 
+/// Convenience function to call `encode` with the default settings
 pub fn encode_default(input: &[u8], moduled: bool) -> Result<Vec<u8>, ()> {
     encode(
         input,
@@ -121,6 +125,11 @@ pub fn encode_default(input: &[u8], moduled: bool) -> Result<Vec<u8>, ()> {
     )
 }
 
+/// Encodes raw data into the Kosinski format
+///
+/// If `moduled` is true then the data will be interpreted
+/// as being in the Kosinski Moduled format, as used in
+/// Sonic 3 and Knuckles
 pub fn encode(
     input: &[u8],
     slide_win: usize,
@@ -232,6 +241,11 @@ fn decode_internal(src: &mut Cursor<Vec<u8>>, dst: &mut Vec<u8>, dec_bytes: &mut
     }
 }
 
+/// Decompresses data that has been Kosinski encoded
+///
+/// If `moduled` is true then the data will be interpreted
+/// as being in the Kosinski Moduled format, as used in
+/// Sonic 3 and Knuckles
 pub fn decode(src: &[u8], moduled: bool) -> Result<Vec<u8>, ()> {
     let mut dec_bytes = 0_usize;
 

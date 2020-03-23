@@ -1,4 +1,7 @@
-use crate::bitstream::{IBitStream, OBitStream, ReadOrdered, WriteOrdered};
+//! Functions for compressing/decompressing Nemesis-formatted data
+
+use crate::bitstream::{IBitStream, OBitStream};
+use crate::io_traits::{ReadOrdered, WriteOrdered};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use multiset::HashMultiSet;
 use std::cmp::Reverse;
@@ -159,6 +162,11 @@ fn decode_internal<R: ReadOrdered<u8> + ?Sized, W: WriteOrdered<u8> + ?Sized>(
     }
 }
 
+/// Decompresses data that has been Nemesis encoded
+///
+/// If `moduled` is true then the data will be interpreted
+/// as being in the Kosinski Moduled format, as used in
+/// Sonic 3 and Knuckles
 pub fn decode<R: ReadOrdered<u8> + ?Sized, W: WriteOrdered<u8> + ?Sized>(src: &mut R, dst: &mut W) {
     let mut rtiles = src.read_u16::<BigEndian>().unwrap() as usize;
     // sets the output mode based on the value of the first bit
@@ -480,6 +488,7 @@ fn split_at_header(src: &[u8]) -> (&[u8], &[u8]) {
     (&src[..=idx], &src[idx + 1..])
 }
 
+/// Encodes raw data into the Nemesis format
 pub fn encode(src: &[u8]) -> Result<Vec<u8>, ()> {
     let mut src = src.to_vec();
 
