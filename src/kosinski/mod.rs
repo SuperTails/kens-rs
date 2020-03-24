@@ -192,10 +192,13 @@ pub fn encode(
 }
 
 fn decode_internal(src: &mut Cursor<Vec<u8>>, dst: &mut Vec<u8>, dec_bytes: &mut usize) {
-    let mut bits = IBitStream::<u16, LittleEndian>::new(src);
+    let mut bits = IBitStream::<u16, LittleEndian>::new();
+    bits.check_buffer(src);
 
     loop {
         if bits.pop(src) {
+            bits.check_buffer(src);
+
             dst.push(src.read_u8().unwrap());
             *dec_bytes += 1;
         } else {
@@ -203,6 +206,8 @@ fn decode_internal(src: &mut Cursor<Vec<u8>>, dst: &mut Vec<u8>, dec_bytes: &mut
             let mut count;
 
             let offset = if bits.pop(src) {
+                bits.check_buffer(src);
+
                 let lo = src.read_u8().unwrap();
                 let hi = src.read_u8().unwrap();
 

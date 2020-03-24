@@ -14,7 +14,7 @@ impl<T: PrimInt, Order: ByteOrder> IBitStream<T, Order> {
         T::zero().count_zeros()
     }
 
-    fn check_buffer<R: ReadOrdered<T> + ?Sized>(&mut self, src: &mut R) {
+    pub fn check_buffer<R: ReadOrdered<T> + ?Sized>(&mut self, src: &mut R) {
         if self.read_bits != 0 {
             return;
         }
@@ -33,18 +33,12 @@ impl<T: PrimInt, Order: ByteOrder> IBitStream<T, Order> {
         }
     }
 
-    pub fn new<R: ReadOrdered<T> + ?Sized>(src: &mut R) -> Self {
-        let mut result = Self {
-            read_bits: Self::bit_width(),
+    pub fn new() -> Self {
+        Self {
+            read_bits: 0,
             byte_buffer: T::zero(),
             _order: PhantomData,
-        };
-        result.byte_buffer = src.read_ordered::<Order>().unwrap();
-        result
-    }
-
-    pub fn byte_buffer(&self) -> T {
-        self.byte_buffer
+        }
     }
 
     /// Gets a single bit from the stream. Remembers previously read bits,
@@ -74,7 +68,9 @@ impl<T: PrimInt, Order: ByteOrder> IBitStream<T, Order> {
     /// and gets a character from the actual stream once all bits in the current
     /// byte have been read.
     pub fn read<R: ReadOrdered<T> + ?Sized>(&mut self, src: &mut R, cnt: u32) -> T {
-        let result = if self.read_bits < cnt {
+        self.check_buffer(src);
+
+        if self.read_bits < cnt {
             let delta = cnt - self.read_bits;
             let bits = self.byte_buffer << delta as usize;
             self.byte_buffer = src.read_ordered::<Order>().unwrap();
@@ -87,11 +83,7 @@ impl<T: PrimInt, Order: ByteOrder> IBitStream<T, Order> {
             let bits = self.byte_buffer >> self.read_bits as usize;
             self.byte_buffer = self.byte_buffer ^ (bits << self.read_bits as usize);
             bits
-        };
-
-        self.check_buffer(src);
-
-        result
+        }
     }
 }
 

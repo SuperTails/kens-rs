@@ -95,7 +95,7 @@ fn decode_internal<R: ReadOrdered<u8> + ?Sized, W: WriteOrdered<u8> + ?Sized>(
     let mut dst = Vec::new();
 
     // Set bit I/O streams.
-    let mut bits = IBitStream::<u8, BigEndian>::new(src);
+    let mut bits = IBitStream::<u8, BigEndian>::new();
     let mut out = OBitStream::<u8, BigEndian>::new();
     let mut code = bits.get(src) as u8;
     let mut len = 1;

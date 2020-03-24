@@ -1,8 +1,7 @@
 use crate::bitstream::{IBitStream, OBitStream};
 use crate::io_traits::{ReadOrdered, WriteOrdered};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
-use std::collections::HashMap;
-use std::convert::TryInto;
+use std::collections::BTreeMap;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,9 +82,8 @@ fn flush_buffer(out: &mut EnigmaData, buffer: &mut Vec<u16>, packet_length: u8) 
         .collect::<Vec<(u16, u16)>>();
 
     let entry = FormatEntry {
-        type_bits: 0b111,
         repeat_count: flags_and_value.len() as u8 - 1,
-        flags_and_value,
+        type_bits: TypeBits::InlineRepeat { data: flags_and_value },
     };
 
     out.body.push(entry);
@@ -95,7 +93,7 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
     // To unpack source into 2-byte words.
     let mut unpack = Vec::<u16>::new();
     // Frequency map.
-    let mut counts = HashMap::<u16, usize>::new();
+    let mut counts = BTreeMap::<u16, usize>::new();
 
     // Unpack source into array. Along the way, build frequency and presence maps.
     let mut maskval: u16 = 0;
@@ -114,12 +112,12 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
     // Find incrementing (not neccessarily contiguous) runs.
     // The original algorithm does this for all 65536 2-byte words, while
     // this version only checks the 2-byte words actually in the file.
-    let mut runs = HashMap::<u16, usize>::new();
+    let mut runs = BTreeMap::<u16, usize>::new();
     for mut next in counts.keys().copied() {
         let val_cnt = runs.entry(next).or_insert(0);
         for it2 in unpack.iter().copied() {
             if it2 == next {
-                next += 1;
+                next = next.wrapping_add(1);
                 *val_cnt += 1;
             }
         }
@@ -148,7 +146,7 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
         if v == incrementing_value {
             flush_buffer(&mut result, &mut buf, packet_length);
 
-            let mut next: u16 = v + 1;
+            let mut next: u16 = v.wrapping_add(1);
 
             let mut repeat_count: u8 = 0;
             let mut i: usize = pos + 1;
@@ -157,15 +155,14 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
                     break;
                 }
 
-                next += 1;
+                next = next.wrapping_add(1);
                 i += 1;
                 repeat_count += 1;
             }
 
             result.body.push(FormatEntry {
-                type_bits: 0b00,
-                flags_and_value: Vec::new(),
                 repeat_count,
+                type_bits: TypeBits::Incremental,
             });
 
             incrementing_value = next;
@@ -185,22 +182,34 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
             }
 
             result.body.push(FormatEntry {
-                type_bits: 0b01,
-                flags_and_value: Vec::new(),
                 repeat_count,
+                type_bits: TypeBits::Literal,
             });
 
             pos += repeat_count as usize;
         } else if pos + 1 < unpack.len() && unpack[pos + 1] != incrementing_value {
             flush_buffer(&mut result, &mut buf, packet_length);
 
-            let delta: i32 = unpack[pos + 1] as i32 - v as i32;
+            let delta: i16 = (unpack[pos + 1] as i16).wrapping_sub(v as i16);
 
-            if delta == -1 || delta == 0 || delta == 1 {
+            let delta = match delta {
+                -1 => Some(Some(Change::Decrement)),
+                0 => Some(None),
+                1 => Some(Some(Change::Increment)),
+                _ => None,
+            };
+
+            if let Some(change) = delta {
                 let mut repeat_count = 1_u8;
 
                 while pos + (repeat_count as usize) < unpack.len() && repeat_count < 0xF {
-                    let expected: u16 = (unpack[pos] as i32 + delta * repeat_count as i32).try_into().unwrap();
+                    let delta = match change {
+                        Some(Change::Decrement) => -1,
+                        None => 0,
+                        Some(Change::Increment) => 1,
+                    };
+
+                    let expected = (unpack[pos] as i16).wrapping_add(delta * repeat_count as i16) as u16;
                     if expected != unpack[pos + repeat_count as usize] {
                         break;
                     }
@@ -210,19 +219,12 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
 
                 repeat_count -= 1;
 
-                let delta_bits = if delta == -1 {
-                    2
-                } else {
-                    delta as u8
-                };
-
                 let value_mask = (1 << packet_length) - 1;
                 let value = value_mask & v;
                 let flags = !value_mask & v;
 
                 result.body.push(FormatEntry {
-                    type_bits: 0b100 | delta_bits,
-                    flags_and_value: vec![(flags, value)],
+                    type_bits: TypeBits::Inline{ flags, value, change },
                     repeat_count,
                 });
 
@@ -248,9 +250,8 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
 
     // Terminator
     result.body.push(FormatEntry {
-        type_bits: 0b111,
+        type_bits: TypeBits::InlineRepeat{ data: Vec::new() },
         repeat_count: 0xF,
-        flags_and_value: Vec::new(),
     });
 
     result
@@ -288,14 +289,12 @@ struct EnigmaData {
 
 impl EnigmaData {
     pub fn deserialize(mut data: &[u8]) -> Self {
-        let mut data = &mut data;
-
         let packet_length: u8 = data.read_u8().unwrap();
         let get_mask = BaseFlagIo::new(data.read_u8().unwrap() as u16);
         let incrementing_value: u16 = data.read_u16::<BigEndian>().unwrap();
         let common_value: u16 = data.read_u16::<BigEndian>().unwrap();
 
-        let bits = IBitStream::new(&mut data);
+        let bits = IBitStream::new();
         let iter = EnigmaDataIter {
             packet_length,
             get_mask,
@@ -326,13 +325,9 @@ impl EnigmaData {
         let mut bits = OBitStream::<u16, BigEndian>::new();
 
         for entry in self.body.iter() {
-            let type_bit_count = if entry.type_bits & 0b100 != 0 { 3 } else { 2 };
-            bits.write(&mut dst, entry.type_bits as u16, type_bit_count);
+            entry.type_bits.write_bits(&mut dst, &mut bits);
             bits.write(&mut dst, entry.repeat_count as u16, 4);
-            for &(flags, value) in entry.flags_and_value.iter() {
-                self.get_mask.write_bitfield(&mut dst, &mut bits, flags);
-                bits.write(&mut dst, value, self.packet_length as u32);
-            }
+            entry.type_bits.write_body(&mut dst, &mut bits, self.get_mask, self.packet_length);
         }
 
         bits.flush(&mut dst, false);
@@ -348,50 +343,41 @@ impl EnigmaData {
         let mut incrementing_value = self.incrementing_value;
 
         for entry in self.body.iter() {
-            match entry.type_bits {
-                0b00 => {
+            match &entry.type_bits {
+                TypeBits::Incremental => {
                     // Copy in the incremental copy word repeat_count + 1 times, add 1 to the word after each copy
                     for _ in 0..entry.repeat_count + 1 {
                         dst.write_u16::<BigEndian>(incrementing_value).unwrap();
-                        incrementing_value += 1;
+                        incrementing_value = incrementing_value.wrapping_add(1);
                     }
                 }
-                0b01 => {
+                TypeBits::Literal => {
                     // Copy the literal copy word repeat_count + 1 times, add 1 to the word after each copy
                     for _ in 0..entry.repeat_count + 1 {
                         dst.write_u16::<BigEndian>(self.common_value).unwrap();
                     }
                 }
-                // Copy inline value repeat_count + 1 times
-                0b100 |
-                // Copy inline value repeat_count + 1 times, increment after each copy
-                0b101 |
-                // Copy inline value repeat_count + 1 times, decrement after each copy
-                0b110 => {
-                    let (flags, value) = entry.flags_and_value[0];
-
+                TypeBits::Inline { flags, value, change } => {
                     let mut outv = value | flags;
                     for _ in 0..entry.repeat_count + 1 {
                         dst.write_u16::<BigEndian>(outv).unwrap();
 
-                        if entry.type_bits == 0b101 {
-                            outv += 1;
-                        } else if entry.type_bits == 0b110 {
-                            outv -= 1;
+                        match change {
+                            Some(Change::Increment) => outv = outv.wrapping_add(1),
+                            Some(Change::Decrement) => outv = outv.wrapping_sub(1),
+                            None => {},
                         }
                     }
                 }
                 // If repeat count is 0xF, terminate decompression, otherwise
                 // copy next inline value and repeat repeat_count + 1 times
-                0b111 => {
-                    let repeat_count = entry.repeat_count;
-                    if repeat_count != 0xF {
-                        for (flags, value) in entry.flags_and_value.iter() {
+                TypeBits::InlineRepeat { data } => {
+                    if entry.repeat_count != 0xF {
+                        for (flags, value) in data.iter() {
                             dst.write_u16::<BigEndian>(flags | value).unwrap();
                         }
                     }
                 }
-                _ => unreachable!(),
             }
         }
     }
@@ -405,37 +391,107 @@ struct EnigmaDataIter<'a> {
     reached_end: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Change {
+    Increment,
+    Decrement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TypeBits {
+    Incremental,
+    Literal,
+    Inline{ flags: u16, value: u16, change: Option<Change> },
+    InlineRepeat{ data: Vec<(u16, u16)> },
+}
+
+impl TypeBits {
+    pub fn bits(&self) -> u8 {
+        match self {
+            TypeBits::Incremental => 0b00,
+            TypeBits::Literal => 0b01,
+            TypeBits::Inline{ change: None, .. } => 0b100,
+            TypeBits::Inline{ change: Some(Change::Increment), .. } => 0b101,
+            TypeBits::Inline{ change: Some(Change::Decrement), .. } => 0b110,
+            TypeBits::InlineRepeat{ .. } => 0b111,
+        }
+    }
+
+    pub fn new<R: ReadOrdered<u16> + ?Sized>(type_bits: u8, repeat_count: u8, get_mask: BaseFlagIo, packet_length: u8, src: &mut R, bits: &mut IBitStream<u16, BigEndian>) -> TypeBits {
+        match type_bits {
+            0b00 => TypeBits::Incremental,
+            0b01 => TypeBits::Literal,
+            0b100 |
+            0b101 |
+            0b110 => {
+                let change = match type_bits {
+                    0b100 => None,
+                    0b101 => Some(Change::Increment),
+                    0b110 => Some(Change::Decrement),
+                    _ => unreachable!(),
+                };
+
+                let flags = get_mask.read_bitfield(src, bits) as u16;
+                let value = bits.read(src, packet_length as u32);
+
+                TypeBits::Inline { flags, value, change }
+            }
+            0b111 => {
+                let data = if repeat_count == 0xF {
+                    Vec::new()
+                } else {
+                    (0..=repeat_count).map(|_| {
+                        let flags = get_mask.read_bitfield(src, bits) as u16;
+                        let value = bits.read(src, packet_length as u32);
+                        (flags, value)
+                    }).collect()
+                };
+
+                TypeBits::InlineRepeat { data }
+            }
+            _ => panic!(),
+        }
+    }
+
+    pub fn write_bits<W: WriteOrdered<u16> + ?Sized>(&self, dst: &mut W, bits: &mut OBitStream<u16, BigEndian>) {
+        let type_bit_count = if self.bits() & 0b100 != 0 { 3 } else { 2 };
+        bits.write(dst, self.bits() as u16, type_bit_count);
+    }
+
+    pub fn write_body<W: WriteOrdered<u16> + ?Sized>(&self, dst: &mut W, bits: &mut OBitStream<u16, BigEndian>, get_mask: BaseFlagIo, packet_length: u8) {
+        match self {
+            TypeBits::Incremental => {},
+            TypeBits::Literal => {},
+            TypeBits::Inline { flags, value, .. } => {
+                get_mask.write_bitfield(dst, bits, *flags);
+                bits.write(dst, *value as u16, packet_length as u32);
+            }
+            TypeBits::InlineRepeat { data } => {
+                for &(flags, value) in data.iter() {
+                    get_mask.write_bitfield(dst, bits, flags);
+                    bits.write(dst, value, packet_length as u32);
+                }
+            }
+        }
+    }
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct FormatEntry {
-    type_bits: u8,
+    type_bits: TypeBits,
     repeat_count: u8,
-    flags_and_value: Vec<(u16, u16)>,
 }
 
 impl fmt::Display for FormatEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let type_bits = if self.type_bits & 0b100 != 0 {
-            format!("{:#b}", self.type_bits)
-        } else {
-            format!("0b{:0>2b}", self.type_bits)
-        };
-        write!(f, "{:>5}: ", type_bits)?;
-        if self.type_bits == 0b111 && self.repeat_count == 15 {
-            write!(f, "Termination sequence")?;
-        } else {
-            write!(f, "{} repeats", self.repeat_count)?;
-            if !self.flags_and_value.is_empty() {
-                let inner: String = self.flags_and_value.iter()
-                    .map(|(flags, copy_value)| {
-                        format!("({:#X} with flags {:#X})", copy_value, flags)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                write!(f, " of [{}]", inner)?;
-            }
+        match &self.type_bits {
+            TypeBits::Incremental => write!(f, "Incremental copy word, {} copies", self.repeat_count + 1),
+            TypeBits::Literal => write!(f, "Literal copy word, {} copies", self.repeat_count + 1),
+            TypeBits::Inline{ flags, value, change } => write!(f, "Inline value of {:#X} with flags {:#X}, with change {:?}, {} copies", value, flags, change, self.repeat_count + 1),
+            TypeBits::InlineRepeat{ .. } if self.repeat_count == 0xF => write!(f, "Termation sequence"),
+            TypeBits::InlineRepeat{ data } => write!(f, "Inline repeat with data {:X?}", data),
         }
-        Ok(())
     }
 }
 
@@ -446,17 +502,6 @@ impl<'a> Iterator for EnigmaDataIter<'a> {
         if self.reached_end {
             None
         } else {
-            // Special case to prevent a crash trying to read more bytes too eagerly
-            if self.bits.byte_buffer() == 0x7F {
-                self.reached_end = true;
-
-                return Some(FormatEntry {
-                    type_bits: 0b111,
-                    repeat_count: 0xF,
-                    flags_and_value: Vec::new(),
-                })
-            }
-
             let type_head = self.bits.get(&mut self.body);
             let (type_body, type_body_len) = if type_head {
                 // 2 more type bits
@@ -468,31 +513,18 @@ impl<'a> Iterator for EnigmaDataIter<'a> {
 
             let repeat_count = self.bits.read(&mut self.body, 4) as u8;
 
-            let fv_count = if type_bits == 0b111  {
-                if repeat_count == 0xF { 0 } else { repeat_count }
-            } else if type_head {
-                1
-            } else {
-                0
-            };
-
-            let flags_and_value = (0..fv_count).map(|_| {
-                let flags = self.get_mask.read_bitfield(&mut self.body, &mut self.bits) as u16;
-                let copy_value = self.bits.read(&mut self.body, self.packet_length as u32);
-                (flags, copy_value)
-            }).collect();
-
             if type_bits == 0b111 && repeat_count == 0xF {
                 self.reached_end = true;
             }
 
+            let type_bits = TypeBits::new(type_bits, repeat_count, self.get_mask, self.packet_length, &mut self.body, &mut self.bits);
+
             let result = FormatEntry {
                 type_bits,
                 repeat_count,
-                flags_and_value,
             };
 
-            println!("{}", result);
+            println!("ITERATOR: {}", result);
 
             Some(result)
         }
@@ -525,6 +557,46 @@ mod test {
     }
 
     #[test]
+    fn fuzz_case_0() {
+        roundtrip_any(&[0xE1, 0x61, 0x61, 0x61]);
+    }
+
+    #[test]
+    fn fuzz_case_1() {
+        roundtrip_any(b"Aaa");
+    }
+
+    #[test]
+    fn fuzz_case_2() {
+        roundtrip_any(&[0x61, 0x61, 0xE1, 0x61]);
+    }
+
+    #[test]
+    fn fuzz_case_3() {
+        roundtrip_any(&[0xFF, 0xFF, 0x61, 0x61]);
+    }
+
+    #[test]
+    fn fuzz_case_4() {
+        roundtrip_any(&[0x68, 0xFF, 0x00, 0x01, 0x00, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn fuzz_case_5() {
+        roundtrip_any(&[0x61, 0xF1, 0xEE, 0x6A, 0x61, 0xF1, 0x7F, 0xFF, 0xAC, 0xC9, 0xAC, 0xAC, 0xAC, 0xAC, 0xAC, 0x96, 0xAC, 0xAC, 0xAC, 0xAC, 0xD0])
+    }
+
+    #[test]
+    fn fuzz_case_6() {
+        roundtrip_any(&[0x6F, 0x7F, 0x03, 0xE8, 0xFF, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF, 0x80, 0x00, 0x00, 0x7F, 0x6F, 0x7F, 0x03, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF, 0x80, 0x13, 0x00, 0x7F, 0x80, 0x7F]);
+    }
+
+    #[test]
+    fn fuzz_case_7() {
+        roundtrip_any(&[0x96, 0x40, 0x00, 0xFC, 0x80, 0x71, 0x7F, 0x0D, 0xFF, 0xFE, 0xFF, 0xFF, 0xFF, 0xF3, 0xFF, 0xFF]);
+    }
+
+    #[test]
     fn example_test() {
         const EXAMPLE: &[u8] = &[
             0x07, 0x0C, 0x00, 0x00, 0x00, 0x10, 0x05, 0x3D, 0x11, 0x8F, 0xE0, 0x00,
@@ -541,6 +613,57 @@ mod test {
         assert_eq!(result, EXPECTED);
     }
 
+    fn roundtrip_any(data: &[u8]) {
+        let mut data = data.to_vec();
+        if data.len() % 2 != 0 {
+            data.push(0);
+        }
+        let data = data;
+
+        print!("Original:\n[");
+        for d in data.iter() {
+            print!("{:#04X}, ", d);
+        }
+        println!("]\n");
+
+        let data_struct = encode_internal(&data);
+        println!("Packet length: {}", data_struct.packet_length);
+        println!("Flags: {:#b}", data_struct.get_mask.n);
+        println!("Common value: {:#X}", data_struct.common_value);
+        println!("Incrementing value: {:#X}", data_struct.incrementing_value);
+        println!("---- Body ----");
+        for b in data_struct.body.iter() {
+            println!("{}", b);
+        }
+        println!("--------------");
+
+        let encoded = data_struct.serialize();
+
+        print!("\nEncoded:\n[");
+        for e in encoded.iter() {
+            print!("{:#04X}, ", e);
+        }
+        println!("]\n");
+
+        let result = decode(&encoded);
+
+        if result != data {
+            eprint!("\nExpected:\n[");
+            for d in data.iter() {
+                eprint!("{:#04X}, ", d);
+            }
+            eprintln!("]");
+
+            eprint!("Actual:\n[");
+            for d in result.iter() {
+                eprint!("{:#04X}, ", d);
+            }
+            eprintln!("]\n");
+        }
+
+        assert_eq!(&result[..], &data[..]);
+    }
+
     #[test]
     fn roundtrip() {
         const DATA: &[u8] = &[
@@ -549,17 +672,7 @@ mod test {
             0x40, 0x10,
         ];
 
-        let encoded = encode(DATA, false).unwrap();
-
-        print!("Encoded:\n[");
-        for e in encoded.iter() {
-            print!("{:#X}, ", e);
-        }
-        println!("]");
-
-        let result = decode(&encoded);
-
-        assert_eq!(&result[..], DATA);
+        roundtrip_any(DATA);
     }
 
     /*const DATA: &[u8; 202] =

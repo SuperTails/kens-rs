@@ -2,3 +2,5 @@
 /kens-1.5a1
 /mdcomp
 /.vscode
+/kens_fuzz/out
+/kens_fuzz/target
