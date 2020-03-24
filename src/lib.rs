@@ -3,8 +3,8 @@
 //! Nemesis, and Saxman formats.
 
 mod bitstream;
-pub mod kosinski;
 pub mod enigma;
+pub mod io_traits;
+pub mod kosinski;
 pub mod nemesis;
 pub mod saxman;
-pub mod io_traits;

@@ -7,9 +7,9 @@ use num_traits::PrimInt;
 use std::convert::TryFrom;
 use std::io::Cursor;
 
-fn push<T: PrimInt, W: WriteOrdered<T>, O: ByteOrder>(
-    bits: &mut OBitStream<T, O>,
+fn push<T: PrimInt, W: WriteOrdered<T> + ?Sized, O: ByteOrder>(
     bit: bool,
+    bits: &mut OBitStream<T, O>,
     dst: &mut W,
     data: &mut Vec<u8>,
 ) {
@@ -19,95 +19,139 @@ fn push<T: PrimInt, W: WriteOrdered<T>, O: ByteOrder>(
     }
 }
 
-fn encode_internal<W: WriteBytesExt>(dst: &mut W, buffer: &[u8], slide_win: usize, rec_len: usize) {
+fn encode_internal(src: &[u8], sliding_window_len: usize, rec_len: usize) -> Vec<u8> {
+    assert!(rec_len < 256 + 2);
+
+    let mut written = Vec::new();
+
+    // The description field, aka field A, which is two bytes long
     let mut bits = OBitStream::<u16, LittleEndian>::new();
+    // The data field, aka field B, which follows the description field
     let mut data = Vec::new();
-    bits.push(dst, true);
 
-    let mut b_pointer = 1_usize;
-    let mut i_offset = 0_usize;
+    // First byte *has* to be uncompressed, because otherwise
+    // we would have nothing to dictionary match against
+    bits.push(&mut written, true);
+    data.push(src[0]);
 
-    data.push(buffer[0]);
+    let mut src_idx: usize = 1;
 
+    // The index of the last match found
+    let mut match_idx: Option<usize> = None;
+
+    #[allow(clippy::identity_op)]
     loop {
-        // Count and Offset
-        let mut i_count: usize = std::cmp::min(rec_len, buffer.len() - b_pointer);
-        let mut k: usize = 1;
+        // The farthest index back we are going to look for dictionary matches
+        let i_min = src_idx.saturating_sub(sliding_window_len);
 
-        // TODO: THIS NEEDS TO BE A "DO WHILE" EQUIVALENT
-        let i_min = b_pointer.saturating_sub(slide_win);
-        for i in (i_min..b_pointer).rev() {
-            // j = size of the longest matching subslice starting at i
-            let mut j = 0_usize;
-            while buffer[i + j] == buffer[b_pointer + j] {
-                j += 1;
-                if j >= i_count {
+        // The maximum length of a dictionary match (obviously limited by the amount of data left as well)
+        let max_match_len = std::cmp::min(rec_len, src.len() - src_idx);
+
+        // TODO: Why does this start at 1?
+        let mut largest_match_len = 1;
+
+        // Search starting as far back as possible
+        for i in (i_min..src_idx).rev() {
+            let mut match_len = 0_usize;
+            let history = &src[i..];
+            let current = &src[src_idx..];
+            while history[match_len] == current[match_len] {
+                match_len += 1;
+                if match_len >= max_match_len {
                     break;
                 }
             }
+            let match_len = match_len;
 
-            if j > k {
-                k = j;
-                i_offset = i;
+            if match_len > largest_match_len {
+                match_idx = Some(i);
+                largest_match_len = match_len;
             }
         }
 
-        i_count = k;
+        // Ideally, we should be able to just compress the whole match!
+        let mut compressed_count = largest_match_len;
 
-        if i_count == 1 {
-            push(&mut bits, true, dst, &mut data);
-            data.push(buffer[b_pointer]);
-        } else if i_count == 2 && b_pointer - i_offset > 256 {
-            push(&mut bits, true, dst, &mut data);
-            data.push(buffer[b_pointer]);
-            i_count -= 1;
-        } else if i_count < 6 && b_pointer - i_offset <= 256 {
-            push(&mut bits, false, dst, &mut data);
-            push(&mut bits, false, dst, &mut data);
-            push(
-                &mut bits,
-                (((i_count - 2) >> 1) as u16 & 1) != 0,
-                dst,
-                &mut data,
-            );
-            push(&mut bits, ((i_count - 2) as u16 & 1) != 0, dst, &mut data);
-            data.push(!(b_pointer - i_offset - 1) as u8);
+        if compressed_count == 1 {
+            // Uncompressed data
+            // There's no point in a dictionary match of length 1
+            push(true, &mut bits, &mut written, &mut data);
+            data.push(src[src_idx]);
+        } else if compressed_count == 2 /*|| (src_idx - match_idx.unwrap() > 256 && compressed_count*/ {
+            // TODO: Determine what the other condition is for
+
+            // Uncompressed data
+            // Again, no point in a dictionary match of length 2
+            push(true, &mut bits, &mut written, &mut data);
+            data.push(src[src_idx]);
+
+            compressed_count = 1;
+        } else if compressed_count < 6 && src_idx - match_idx.unwrap() <= 256 {
+            // Inline dictionary match
+            // Inline matches can only have at most 6 bytes, and an offset of -256 or less
+
+            // This field is offset by 2
+            let count = compressed_count - 2;
+
+            push(false, &mut bits, &mut written, &mut data);
+            push(false, &mut bits, &mut written, &mut data);
+            push(count & (1 << 1) != 0, &mut bits, &mut written, &mut data);
+            push(count & (1 << 0) != 0, &mut bits, &mut written, &mut data);
+
+            data.push(!(src_idx - match_idx.unwrap() - 1) as u8);
         } else {
-            push(&mut bits, false, dst, &mut data);
-            push(&mut bits, true, dst, &mut data);
+            // Full dictionary match
 
-            let off = (b_pointer - i_offset - 1) as u16;
-            let mut info = (!((off << 8) | (off >> 5)) & 0xFFF8) as u16;
-            if i_count - 2 < 8 {
-                info |= (i_count - 2) as u8 as u16;
-                data.write_u16::<BigEndian>(info).unwrap();
+            // This field is offset by 2
+            let count = compressed_count - 2;
+
+            let offset = !(src_idx - match_idx.unwrap() - 1) as u16;
+            let offset_lo = offset as u8;
+            let offset_hi = (offset >> 8) as u8;
+
+            push(false, &mut bits, &mut written, &mut data);
+            push(true,  &mut bits, &mut written, &mut data);
+
+            data.write_u8(offset_lo).unwrap();
+
+            if count < 8 {
+                // Use the two byte format
+                data.write_u8((offset_hi << 3) | count as u8).unwrap();
             } else {
-                data.write_u16::<BigEndian>(info).unwrap();
-                data.push((i_count - 1) as u8);
+                data.write_u8(offset_hi << 3).unwrap();
+                data.write_u8(count as u8).unwrap();
             }
         }
 
-        b_pointer += i_count;
+        // We've finished with these bytes
+        src_idx += compressed_count;
 
-        if b_pointer >= buffer.len() {
+        if src_idx >= src.len() {
             break;
         }
     }
 
-    push(&mut bits, false, dst, &mut data);
-    push(&mut bits, true, dst, &mut data);
+    push(false, &mut bits, &mut written, &mut data);
+    push(true, &mut bits, &mut written, &mut data);
 
+    // The Kosinski algorithm will greedily
+    // read another description field, so we need to give it one
     if bits.waiting_bits() == 0 {
         data.push(0);
         data.push(0);
     }
 
+    // TODO: Isn't this supposed to be the end-of-compression sequence?
     data.push(0x00);
     data.push(0xF0);
     data.push(0x00);
 
-    bits.flush(dst, true);
-    dst.write_all(&data[..]).unwrap();
+    // TODO: Why true?
+    bits.flush(&mut written, true);
+
+    written.extend_from_slice(&data);
+
+    written
 }
 
 pub const DEFAULT_SLIDE_WIN: usize = 8192;
@@ -155,12 +199,13 @@ pub fn encode(
         dst.write_u16::<BigEndian>(full_size as u16).unwrap();
 
         loop {
-            encode_internal(
-                &mut dst,
+            let encoded = encode_internal(
                 &input[input_idx..][..input_len],
                 slide_win,
                 rec_len,
             );
+
+            dst.extend_from_slice(&encoded);
 
             comp_bytes += input_len;
             input_idx += input_len;
@@ -180,7 +225,8 @@ pub fn encode(
             input_len = std::cmp::min(module_size, full_size - comp_bytes);
         }
     } else {
-        encode_internal(&mut dst, input, slide_win, rec_len);
+        let encoded = encode_internal(input, slide_win, rec_len);
+        dst.extend_from_slice(&encoded);
     }
 
     // Pad to even size.
@@ -203,38 +249,48 @@ fn decode_internal(src: &mut Cursor<Vec<u8>>, dst: &mut Vec<u8>, dec_bytes: &mut
             *dec_bytes += 1;
         } else {
             // Count and Offset
-            let mut count;
+            let (count, offset) = if bits.pop(src) {
+                // Full dictionary match
 
-            let offset = if bits.pop(src) {
                 bits.check_buffer(src);
 
                 let lo = src.read_u8().unwrap();
                 let hi = src.read_u8().unwrap();
 
-                count = hi as usize & 0x07;
+                let offset = (((0xF8 & hi as isize) << 5) | lo as isize) - 0x2000;
 
-                if count == 0 {
-                    count = src.read_u8().unwrap() as usize;
-                    if count == 0 {
+                let count = hi as usize & 0x07;
+
+                let count = if count == 0 {
+                    // Three byte form
+                    let tmp = src.read_u8().unwrap() as usize;
+                    if tmp == 0 {
                         break;
-                    } else if count == 1 {
+                    } else if tmp == 1 {
                         continue;
                     }
+
+                    tmp
                 } else {
-                    count += 1;
-                }
+                    count
+                };
 
-                (((0xF8 & hi as isize) << 5) | lo as isize) - 0x2000
+                (count, offset)
             } else {
-                let lo = bits.pop(src);
+                // Inline dictionary match
+
+                // Count 
                 let hi = bits.pop(src);
+                let lo = bits.pop(src);
+                bits.check_buffer(src);
+                
+                let count = ((hi as usize) << 1) | lo as usize;
+                let offset = src.read_u8().unwrap() as isize - 0x100;
 
-                count = ((lo as usize) << 1) | ((hi as usize) + 1);
-
-                src.read_u8().unwrap() as isize - 0x100
+                (count, offset)
             };
 
-            for _ in 0..=count {
+            for _ in 0..count + 2 {
                 let idx = usize::try_from(offset + dst.len() as isize)
                     .unwrap_or_else(|_| panic!("Offset too large: {}", offset));
                 let byte = dst[idx];
@@ -298,13 +354,33 @@ mod test {
         assert_eq!(decode(&compressed, false), Ok(uncompressed));
     }
 
+    fn roundtrip2(uncompressed: &[u8], moduled: bool) {
+        let compressed = encode_default(&uncompressed, moduled).unwrap();
+        print!("Compressed:\n[");
+        for b in compressed.iter() {
+            print!("{:02X}, ", b);
+        }
+        println!("]");
+
+        let result = decode(&compressed, moduled).unwrap();
+
+        if result != &uncompressed[..] {
+            eprint!("\nExpected:\n[");
+            for b in uncompressed.iter() {
+                eprint!("{:02X}, ", b);
+            }
+            eprint!("]\nActual:\n[");
+            for b in result.iter() {
+                eprint!("{:02X}, ", b);
+            }
+            eprintln!("]\n");
+        }
+
+        assert_eq!(decode(&compressed, false).unwrap(), &uncompressed[..]);
+    }
+
     fn roundtrip(uncompressed: &str) {
-        let uncompressed = parse_data(uncompressed);
-
-        let compressed = encode_default(&uncompressed, false).unwrap();
-        println!("Compressed: {:X?}", compressed);
-
-        assert_eq!(decode(&compressed, false), Ok(uncompressed));
+        roundtrip2(&parse_data(uncompressed), false);
     }
 
     #[test]
@@ -338,5 +414,14 @@ mod test {
         roundtrip(
             "54 3B C4 44 54 33 33 5B 2D 5C 44 5C C4 C5 C4 C5 C3 44 78 88 98 44 30 30 30 30 30 30 30 30 30 30",
         )
+    }
+
+    #[test]
+    fn fuzz_case_0() {
+        roundtrip2(&[
+            0x60, 0xe0, 0xe0, 0xe0, 0xe0, 0xe0, 0xe0, 0x0e, 0x20, 0x80, 0x00, 0x00, 0x00, 0xe0,
+            0xe0, 0xe0, 0x00, 0x84, 0x00, 0x00, 0xe0, 0xe0, 0xfa, 0xe0, 0x90, 0x00, 0x00, 0x23,
+            0xe0, 0x67,
+        ], false);
     }
 }

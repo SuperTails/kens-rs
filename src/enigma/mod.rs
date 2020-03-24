@@ -83,7 +83,9 @@ fn flush_buffer(out: &mut EnigmaData, buffer: &mut Vec<u16>, packet_length: u8) 
 
     let entry = FormatEntry {
         repeat_count: flags_and_value.len() as u8 - 1,
-        type_bits: TypeBits::InlineRepeat { data: flags_and_value },
+        type_bits: TypeBits::InlineRepeat {
+            data: flags_and_value,
+        },
     };
 
     out.body.push(entry);
@@ -209,7 +211,8 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
                         Some(Change::Increment) => 1,
                     };
 
-                    let expected = (unpack[pos] as i16).wrapping_add(delta * repeat_count as i16) as u16;
+                    let expected =
+                        (unpack[pos] as i16).wrapping_add(delta * repeat_count as i16) as u16;
                     if expected != unpack[pos + repeat_count as usize] {
                         break;
                     }
@@ -224,7 +227,11 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
                 let flags = !value_mask & v;
 
                 result.body.push(FormatEntry {
-                    type_bits: TypeBits::Inline{ flags, value, change },
+                    type_bits: TypeBits::Inline {
+                        flags,
+                        value,
+                        change,
+                    },
                     repeat_count,
                 });
 
@@ -250,7 +257,7 @@ fn encode_internal(src: &[u8]) -> EnigmaData {
 
     // Terminator
     result.body.push(FormatEntry {
-        type_bits: TypeBits::InlineRepeat{ data: Vec::new() },
+        type_bits: TypeBits::InlineRepeat { data: Vec::new() },
         repeat_count: 0xF,
     });
 
@@ -327,7 +334,9 @@ impl EnigmaData {
         for entry in self.body.iter() {
             entry.type_bits.write_bits(&mut dst, &mut bits);
             bits.write(&mut dst, entry.repeat_count as u16, 4);
-            entry.type_bits.write_body(&mut dst, &mut bits, self.get_mask, self.packet_length);
+            entry
+                .type_bits
+                .write_body(&mut dst, &mut bits, self.get_mask, self.packet_length);
         }
 
         bits.flush(&mut dst, false);
@@ -357,7 +366,11 @@ impl EnigmaData {
                         dst.write_u16::<BigEndian>(self.common_value).unwrap();
                     }
                 }
-                TypeBits::Inline { flags, value, change } => {
+                TypeBits::Inline {
+                    flags,
+                    value,
+                    change,
+                } => {
                     let mut outv = value | flags;
                     for _ in 0..entry.repeat_count + 1 {
                         dst.write_u16::<BigEndian>(outv).unwrap();
@@ -365,7 +378,7 @@ impl EnigmaData {
                         match change {
                             Some(Change::Increment) => outv = outv.wrapping_add(1),
                             Some(Change::Decrement) => outv = outv.wrapping_sub(1),
-                            None => {},
+                            None => {}
                         }
                     }
                 }
@@ -401,8 +414,14 @@ enum Change {
 enum TypeBits {
     Incremental,
     Literal,
-    Inline{ flags: u16, value: u16, change: Option<Change> },
-    InlineRepeat{ data: Vec<(u16, u16)> },
+    Inline {
+        flags: u16,
+        value: u16,
+        change: Option<Change>,
+    },
+    InlineRepeat {
+        data: Vec<(u16, u16)>,
+    },
 }
 
 impl TypeBits {
@@ -410,20 +429,31 @@ impl TypeBits {
         match self {
             TypeBits::Incremental => 0b00,
             TypeBits::Literal => 0b01,
-            TypeBits::Inline{ change: None, .. } => 0b100,
-            TypeBits::Inline{ change: Some(Change::Increment), .. } => 0b101,
-            TypeBits::Inline{ change: Some(Change::Decrement), .. } => 0b110,
-            TypeBits::InlineRepeat{ .. } => 0b111,
+            TypeBits::Inline { change: None, .. } => 0b100,
+            TypeBits::Inline {
+                change: Some(Change::Increment),
+                ..
+            } => 0b101,
+            TypeBits::Inline {
+                change: Some(Change::Decrement),
+                ..
+            } => 0b110,
+            TypeBits::InlineRepeat { .. } => 0b111,
         }
     }
 
-    pub fn new<R: ReadOrdered<u16> + ?Sized>(type_bits: u8, repeat_count: u8, get_mask: BaseFlagIo, packet_length: u8, src: &mut R, bits: &mut IBitStream<u16, BigEndian>) -> TypeBits {
+    pub fn new<R: ReadOrdered<u16> + ?Sized>(
+        type_bits: u8,
+        repeat_count: u8,
+        get_mask: BaseFlagIo,
+        packet_length: u8,
+        src: &mut R,
+        bits: &mut IBitStream<u16, BigEndian>,
+    ) -> TypeBits {
         match type_bits {
             0b00 => TypeBits::Incremental,
             0b01 => TypeBits::Literal,
-            0b100 |
-            0b101 |
-            0b110 => {
+            0b100 | 0b101 | 0b110 => {
                 let change = match type_bits {
                     0b100 => None,
                     0b101 => Some(Change::Increment),
@@ -434,17 +464,23 @@ impl TypeBits {
                 let flags = get_mask.read_bitfield(src, bits) as u16;
                 let value = bits.read(src, packet_length as u32);
 
-                TypeBits::Inline { flags, value, change }
+                TypeBits::Inline {
+                    flags,
+                    value,
+                    change,
+                }
             }
             0b111 => {
                 let data = if repeat_count == 0xF {
                     Vec::new()
                 } else {
-                    (0..=repeat_count).map(|_| {
-                        let flags = get_mask.read_bitfield(src, bits) as u16;
-                        let value = bits.read(src, packet_length as u32);
-                        (flags, value)
-                    }).collect()
+                    (0..=repeat_count)
+                        .map(|_| {
+                            let flags = get_mask.read_bitfield(src, bits) as u16;
+                            let value = bits.read(src, packet_length as u32);
+                            (flags, value)
+                        })
+                        .collect()
                 };
 
                 TypeBits::InlineRepeat { data }
@@ -453,15 +489,25 @@ impl TypeBits {
         }
     }
 
-    pub fn write_bits<W: WriteOrdered<u16> + ?Sized>(&self, dst: &mut W, bits: &mut OBitStream<u16, BigEndian>) {
+    pub fn write_bits<W: WriteOrdered<u16> + ?Sized>(
+        &self,
+        dst: &mut W,
+        bits: &mut OBitStream<u16, BigEndian>,
+    ) {
         let type_bit_count = if self.bits() & 0b100 != 0 { 3 } else { 2 };
         bits.write(dst, self.bits() as u16, type_bit_count);
     }
 
-    pub fn write_body<W: WriteOrdered<u16> + ?Sized>(&self, dst: &mut W, bits: &mut OBitStream<u16, BigEndian>, get_mask: BaseFlagIo, packet_length: u8) {
+    pub fn write_body<W: WriteOrdered<u16> + ?Sized>(
+        &self,
+        dst: &mut W,
+        bits: &mut OBitStream<u16, BigEndian>,
+        get_mask: BaseFlagIo,
+        packet_length: u8,
+    ) {
         match self {
-            TypeBits::Incremental => {},
-            TypeBits::Literal => {},
+            TypeBits::Incremental => {}
+            TypeBits::Literal => {}
             TypeBits::Inline { flags, value, .. } => {
                 get_mask.write_bitfield(dst, bits, *flags);
                 bits.write(dst, *value as u16, packet_length as u32);
@@ -476,7 +522,6 @@ impl TypeBits {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct FormatEntry {
     type_bits: TypeBits,
@@ -486,11 +531,26 @@ struct FormatEntry {
 impl fmt::Display for FormatEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.type_bits {
-            TypeBits::Incremental => write!(f, "Incremental copy word, {} copies", self.repeat_count + 1),
+            TypeBits::Incremental => {
+                write!(f, "Incremental copy word, {} copies", self.repeat_count + 1)
+            }
             TypeBits::Literal => write!(f, "Literal copy word, {} copies", self.repeat_count + 1),
-            TypeBits::Inline{ flags, value, change } => write!(f, "Inline value of {:#X} with flags {:#X}, with change {:?}, {} copies", value, flags, change, self.repeat_count + 1),
-            TypeBits::InlineRepeat{ .. } if self.repeat_count == 0xF => write!(f, "Termation sequence"),
-            TypeBits::InlineRepeat{ data } => write!(f, "Inline repeat with data {:X?}", data),
+            TypeBits::Inline {
+                flags,
+                value,
+                change,
+            } => write!(
+                f,
+                "Inline value of {:#X} with flags {:#X}, with change {:?}, {} copies",
+                value,
+                flags,
+                change,
+                self.repeat_count + 1
+            ),
+            TypeBits::InlineRepeat { .. } if self.repeat_count == 0xF => {
+                write!(f, "Termation sequence")
+            }
+            TypeBits::InlineRepeat { data } => write!(f, "Inline repeat with data {:X?}", data),
         }
     }
 }
@@ -517,7 +577,14 @@ impl<'a> Iterator for EnigmaDataIter<'a> {
                 self.reached_end = true;
             }
 
-            let type_bits = TypeBits::new(type_bits, repeat_count, self.get_mask, self.packet_length, &mut self.body, &mut self.bits);
+            let type_bits = TypeBits::new(
+                type_bits,
+                repeat_count,
+                self.get_mask,
+                self.packet_length,
+                &mut self.body,
+                &mut self.bits,
+            );
 
             let result = FormatEntry {
                 type_bits,
@@ -583,17 +650,27 @@ mod test {
 
     #[test]
     fn fuzz_case_5() {
-        roundtrip_any(&[0x61, 0xF1, 0xEE, 0x6A, 0x61, 0xF1, 0x7F, 0xFF, 0xAC, 0xC9, 0xAC, 0xAC, 0xAC, 0xAC, 0xAC, 0x96, 0xAC, 0xAC, 0xAC, 0xAC, 0xD0])
+        roundtrip_any(&[
+            0x61, 0xF1, 0xEE, 0x6A, 0x61, 0xF1, 0x7F, 0xFF, 0xAC, 0xC9, 0xAC, 0xAC, 0xAC, 0xAC,
+            0xAC, 0x96, 0xAC, 0xAC, 0xAC, 0xAC, 0xD0,
+        ])
     }
 
     #[test]
     fn fuzz_case_6() {
-        roundtrip_any(&[0x6F, 0x7F, 0x03, 0xE8, 0xFF, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF, 0x80, 0x00, 0x00, 0x7F, 0x6F, 0x7F, 0x03, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF, 0x80, 0x13, 0x00, 0x7F, 0x80, 0x7F]);
+        roundtrip_any(&[
+            0x6F, 0x7F, 0x03, 0xE8, 0xFF, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF, 0x80, 0x00,
+            0x00, 0x7F, 0x6F, 0x7F, 0x03, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF, 0x80, 0x13, 0x00,
+            0x7F, 0x80, 0x7F,
+        ]);
     }
 
     #[test]
     fn fuzz_case_7() {
-        roundtrip_any(&[0x96, 0x40, 0x00, 0xFC, 0x80, 0x71, 0x7F, 0x0D, 0xFF, 0xFE, 0xFF, 0xFF, 0xFF, 0xF3, 0xFF, 0xFF]);
+        roundtrip_any(&[
+            0x96, 0x40, 0x00, 0xFC, 0x80, 0x71, 0x7F, 0x0D, 0xFF, 0xFE, 0xFF, 0xFF, 0xFF, 0xF3,
+            0xFF, 0xFF,
+        ]);
     }
 
     #[test]
@@ -693,7 +770,7 @@ mod test {
                     } else {
                         tile[idx] >> 4
                     };
-                    
+
                     if data == 0 {
                         print!(".");
                     } else {

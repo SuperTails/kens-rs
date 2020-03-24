@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
-use std::io::{Write, Cursor};
+use std::io::{Cursor, Write};
 
 pub fn decode(src: &[u8], is_z80: bool) -> Vec<u8> {
     let mut src = if is_z80 {
@@ -39,7 +39,9 @@ fn decode_single_field(src: &mut Cursor<&[u8]>, dst: &mut Cursor<Vec<u8>>) {
 
             let base = ((hi as u16 & 0xF0) << 4) | lo as u16;
             let base = (base + 0x12) & 0xFFF;
-            let source = ((base.wrapping_sub(dst.position() as u16)) & 0xFFF).wrapping_add(dst.position() as u16).wrapping_sub(0x1000);
+            let source = ((base.wrapping_sub(dst.position() as u16)) & 0xFFF)
+                .wrapping_add(dst.position() as u16)
+                .wrapping_sub(0x1000);
 
             if source as u64 >= dst.position() {
                 // Zero fill

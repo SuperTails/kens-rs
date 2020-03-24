@@ -57,10 +57,10 @@ impl<T: PrimInt, Order: ByteOrder> IBitStream<T, Order> {
     /// byte have been read.
     /// Treats bits as being in the reverse order of the get function.
     pub fn pop<R: ReadOrdered<T>>(&mut self, src: &mut R) -> bool {
+        self.check_buffer(src);
         self.read_bits -= 1;
         let bit = self.byte_buffer & T::one();
         self.byte_buffer = self.byte_buffer >> 1;
-        self.check_buffer(src);
         bit != T::zero()
     }
 
@@ -112,7 +112,7 @@ impl<T: PrimInt, Order: ByteOrder> OBitStream<T, Order> {
     /// are `bit_width()` bits stored in the buffer.
     ///
     /// This puts the new bit as the LSB, i.e. on the right side of `byte_buffer`
-    pub fn put<W: WriteOrdered<T>>(&mut self, mut dst: W, data: bool) -> bool {
+    pub fn put<W: WriteOrdered<T> + ?Sized>(&mut self, dst: &mut W, data: bool) -> bool {
         let bit = if data { T::one() } else { T::zero() };
 
         self.byte_buffer = (self.byte_buffer << 1) | bit;
@@ -133,7 +133,7 @@ impl<T: PrimInt, Order: ByteOrder> OBitStream<T, Order> {
     ///
     /// Treats bits as being in the reverse order of the put function, i.e.
     /// it stores new bits on top of/on the left of `byte_buffer`
-    pub fn push<W: WriteOrdered<T>>(&mut self, dst: &mut W, data: bool) -> bool {
+    pub fn push<W: WriteOrdered<T> + ?Sized>(&mut self, dst: &mut W, data: bool) -> bool {
         let bit = if data { T::one() } else { T::zero() };
 
         self.byte_buffer = self.byte_buffer | (bit << self.waiting_bits as usize);
@@ -204,4 +204,27 @@ impl<T: PrimInt, Order: ByteOrder> Default for OBitStream<T, Order> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn istream_pop() {
+        let data = &[0xF3, 0x8F];
+
+        let expected = "1100 1111 1111 0001".chars().filter_map(|c| if c != ' ' { Some(c == '1') } else { None } ).collect::<Vec<bool>>();
+
+        let mut bits = IBitStream::<u16, byteorder::LittleEndian>::new();
+        let mut actual = Vec::new();
+        
+        let mut data_view = &data[..];
+        for _ in 0..16 {
+            actual.push(bits.pop(&mut data_view));
+        }
+
+        assert_eq!(expected, actual);
+    }
+
 }

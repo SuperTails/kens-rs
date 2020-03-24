@@ -848,7 +848,13 @@ mod test {
     }
 
     fn roundtrip(data: &[u8]) {
-        let compressed = encode(data).unwrap();
+        let mut data = data.to_vec();
+        for _ in 0..0x20 - (data.len() % 0x20) {
+            data.push(0);
+        }
+        let data = data;
+
+        let compressed = encode(&data).unwrap();
         println!("Attempting to decode:\n{:X?}", split_at_header(&compressed));
         let mut result = Vec::new();
         decode(&mut &compressed[..], &mut result);
@@ -867,6 +873,16 @@ mod test {
 
             panic!();
         }
+    }
+
+    #[test]
+    fn fuzz_case_0() {
+        roundtrip(b"aaaa");
+    }
+
+    #[test]
+    fn fuzz_case_1() {
+        roundtrip(b"abcdefghijklmnopqrstuvwxyz");
     }
 
     #[test]
