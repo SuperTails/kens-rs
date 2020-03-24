@@ -1,7 +1,7 @@
 //! Functions for compressing/decompressing Kosinski-formatted data
 
-use crate::io_traits::WriteOrdered;
 use crate::bitstream::{IBitStream, OBitStream};
+use crate::io_traits::WriteOrdered;
 use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use num_traits::PrimInt;
 use std::convert::TryFrom;
@@ -126,7 +126,7 @@ pub fn encode_default(input: &[u8], moduled: bool) -> Result<Vec<u8>, ()> {
 }
 
 /// Encodes raw data into the Kosinski format
-/// 
+///
 /// If `moduled` is true then the data will be interpreted
 /// as being in the Kosinski Moduled format, as used in
 /// Sonic 3 and Knuckles
@@ -242,7 +242,7 @@ fn decode_internal(src: &mut Cursor<Vec<u8>>, dst: &mut Vec<u8>, dec_bytes: &mut
 }
 
 /// Decompresses data that has been Kosinski encoded
-/// 
+///
 /// If `moduled` is true then the data will be interpreted
 /// as being in the Kosinski Moduled format, as used in
 /// Sonic 3 and Knuckles

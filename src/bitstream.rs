@@ -1,7 +1,7 @@
+use crate::io_traits::{ReadOrdered, WriteOrdered};
 use byteorder::ByteOrder;
 use num_traits::PrimInt;
 use std::marker::PhantomData;
-use crate::io_traits::{ReadOrdered, WriteOrdered};
 
 pub struct IBitStream<T: PrimInt, Order: ByteOrder> {
     read_bits: u32,
@@ -43,6 +43,10 @@ impl<T: PrimInt, Order: ByteOrder> IBitStream<T, Order> {
         result
     }
 
+    pub fn byte_buffer(&self) -> T {
+        self.byte_buffer
+    }
+
     /// Gets a single bit from the stream. Remembers previously read bits,
     /// and gets a character from the actual stream once all bits in the current
     /// byte have been read.
@@ -70,8 +74,7 @@ impl<T: PrimInt, Order: ByteOrder> IBitStream<T, Order> {
     /// and gets a character from the actual stream once all bits in the current
     /// byte have been read.
     pub fn read<R: ReadOrdered<T> + ?Sized>(&mut self, src: &mut R, cnt: u32) -> T {
-        self.check_buffer(src);
-        if self.read_bits < cnt {
+        let result = if self.read_bits < cnt {
             let delta = cnt - self.read_bits;
             let bits = self.byte_buffer << delta as usize;
             self.byte_buffer = src.read_ordered::<Order>().unwrap();
@@ -84,7 +87,11 @@ impl<T: PrimInt, Order: ByteOrder> IBitStream<T, Order> {
             let bits = self.byte_buffer >> self.read_bits as usize;
             self.byte_buffer = self.byte_buffer ^ (bits << self.read_bits as usize);
             bits
-        }
+        };
+
+        self.check_buffer(src);
+
+        result
     }
 }
 

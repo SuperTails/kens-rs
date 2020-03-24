@@ -1,12 +1,12 @@
 //! `ReadOrdered` and `WriteOrdered` say that a type can be read from/written to
 //! with integers of a certain size in either byte ordering.
-//! 
+//!
 //! The traits `ReadOrdered` and `WriteOrdered` are implemented
 //! for any type that implements `Read` and `Write` (respectively) for all of the common
 //! integer types, so it **does not need to be implemented by the user**
 
+use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt};
 use num_traits::PrimInt;
-use byteorder::{ReadBytesExt, WriteBytesExt, ByteOrder};
 
 pub trait ReadOrdered<T: PrimInt>: ReadBytesExt {
     fn read_ordered<Order: ByteOrder>(&mut self) -> std::io::Result<T>;
@@ -69,4 +69,3 @@ make_impl! { 4, u32, read_u32, write_u32 }
 make_impl! { 4, i32, read_i32, write_i32 }
 make_impl! { 8, u64, read_u64, write_u64 }
 make_impl! { 8, i64, read_i64, write_i64 }
-

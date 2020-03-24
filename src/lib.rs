@@ -1,9 +1,10 @@
-//! A Rust rewrite of the KENS library for 
+//! A Rust rewrite of the KENS library for
 //! compressing and decompressing data in the Kosinski, Enigma,
 //! Nemesis, and Saxman formats.
 
 mod bitstream;
 pub mod kosinski;
+pub mod enigma;
 pub mod nemesis;
 pub mod saxman;
 pub mod io_traits;
